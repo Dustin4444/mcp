@@ -51,7 +51,9 @@ const REGISTERED_SCOPES = [
   'auditlogs:read',
   'logs.read',
   'logs.write',
-  'ssl_certs:write',
+  'account-ssl-and-certificates.write',
+  'ssl-and-certificates.read',
+  'ssl-and-certificates.write',
   'lb:read',
   'lb:edit',
   'queues:write',
@@ -163,11 +165,22 @@ describe('scopes', () => {
     it('read-only template should include dot-notation read scopes', () => {
       expect(SCOPE_TEMPLATES['read-only'].scopes).toContain('registrar-domains.read')
       expect(SCOPE_TEMPLATES['read-only'].scopes).toContain('logs.read')
+      expect(SCOPE_TEMPLATES['read-only'].scopes).toContain('ssl-and-certificates.read')
     })
 
-    it('full-access template should skip sensitive or high-volume scopes', () => {
+    it('full-access template should include derived SSL certificate access', () => {
+      expect(SCOPE_TEMPLATES.yolo.scopes).toContain('account-ssl-and-certificates.write')
+      expect(SCOPE_TEMPLATES.yolo.scopes).toContain('ssl-and-certificates.write')
+    })
+
+    it('full-access template should preserve existing logs access', () => {
+      expect(SCOPE_TEMPLATES.yolo.scopes).toContain('logs.read')
+    })
+
+    it('full-access template should skip sensitive, high-volume, or redundant scopes', () => {
       expect(SCOPE_TEMPLATES.yolo.scopes).not.toContain('teams:pii')
       expect(SCOPE_TEMPLATES.yolo.scopes).not.toContain('logs.write')
+      expect(SCOPE_TEMPLATES.yolo.scopes).not.toContain('ssl-and-certificates.read')
     })
   })
 
@@ -190,7 +203,13 @@ describe('scopes', () => {
   })
 
   describe('MAX_SCOPES', () => {
-    it('all templates should be within the max scope limit', () => {
+    it('should not impose an app-side scope cap', () => {
+      expect(MAX_SCOPES).toBeUndefined()
+    })
+
+    it('all templates should be within the max scope limit when one is configured', () => {
+      if (MAX_SCOPES === undefined) return
+
       for (const [templateName, template] of Object.entries(SCOPE_TEMPLATES)) {
         expect(
           template.scopes.length,
