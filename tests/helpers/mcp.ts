@@ -9,7 +9,7 @@ export interface McpToolResult {
   result?: {
     resultType?: string
     supportedVersions?: string[]
-    serverInfo?: { name: string; version: string }
+    _meta?: Record<string, unknown>
     content?: Array<{ type: string; text: string }>
     isError?: boolean
     tools?: Array<{
