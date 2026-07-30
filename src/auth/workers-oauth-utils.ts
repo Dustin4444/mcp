@@ -198,6 +198,11 @@ export interface ScopeTemplate {
   scopes: readonly string[]
 }
 
+export interface ScopeDefinition {
+  name: string
+  category: string
+}
+
 /**
  * Configuration for the approval dialog
  */
@@ -211,11 +216,10 @@ export interface ApprovalDialogOptions {
   state: Record<string, unknown>
   csrfToken: string
   setCookie: string
-  scopeTemplates?: Record<string, ScopeTemplate>
-  allScopes?: Record<string, string>
-  defaultTemplate?: string
-  maxScopes?: number
-  requiredScopes?: readonly string[]
+  scopeTemplates: Record<string, ScopeTemplate>
+  scopeDefinitions: Record<string, ScopeDefinition>
+  defaultTemplate: string
+  requiredScopes: readonly string[]
 }
 
 /**
@@ -240,50 +244,22 @@ const RESOURCE_LABELS: Record<string, string> = {
   aig: 'AI Gateway',
   aiaudit: 'AI Audit',
   'ai-search': 'AI Search',
-  auditlogs: 'Audit logs',
   'account-analytics': 'Account analytics',
-  browser: 'Browser Rendering',
-  cfone: 'Cloudflare One',
-  connectivity: 'Connectivity',
   containers: 'Containers',
   d1: 'D1',
-  dex: 'DEX',
-  dns_analytics: 'DNS analytics',
-  dns_records: 'DNS records',
-  dns_settings: 'DNS settings',
-  email_routing: 'Email routing',
-  email_sending: 'Email sending',
-  lb: 'Load Balancer',
-  logpush: 'Logpush',
   logs: 'Logs',
-  mcp_portals: 'MCP Portals',
-  notification: 'Notifications',
   offline_access: 'Offline access',
   pages: 'Pages',
   pipelines: 'Pipelines',
   queues: 'Queues',
-  query_cache: 'Query Cache',
-  r2_catalog: 'R2',
   radar: 'Radar',
-  secrets_store: 'Secrets Store',
-  'sso-connector': 'SSO Connector',
   'account-ssl-and-certificates': 'Account SSL and Certificates',
   'ssl-and-certificates': 'SSL and Certificates',
   teams: 'Teams (Zero Trust)',
   snippets: 'Snippets',
-  url_scanner: 'URL Scanner',
   user: 'User',
   account: 'Account',
   vectorize: 'Vectorize',
-  workers: 'Workers',
-  workers_builds: 'Workers Builds',
-  workers_deployments: 'Workers Deployments',
-  workers_kv: 'Workers KV',
-  workers_observability: 'Workers Observability',
-  workers_observability_telemetry: 'Workers Observability Telemetry',
-  workers_routes: 'Workers Routes',
-  workers_scripts: 'Workers Scripts',
-  workers_tail: 'Workers Tail',
   zone: 'Zone'
 }
 
@@ -293,8 +269,49 @@ const RESOURCE_LABELS: Record<string, string> = {
  */
 function humanize(key: string): string {
   if (RESOURCE_LABELS[key]) return RESOURCE_LABELS[key]
-  const spaced = key.replace(/[_-]/g, ' ')
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1)
+
+  const acronyms = new Map(
+    [
+      'ai',
+      'api',
+      'bgp',
+      'cds',
+      'cf',
+      'd1',
+      'ddos',
+      'dex',
+      'dls',
+      'dmarc',
+      'dns',
+      'fbm',
+      'http',
+      'idp',
+      'iot',
+      'ip',
+      'l4',
+      'mcp',
+      'mtls',
+      'pcaps',
+      'pii',
+      'r2',
+      'saml',
+      'scim',
+      'sso',
+      'ssh',
+      'ssl',
+      'tls',
+      'url',
+      'vpc',
+      'waf',
+      'wan',
+      'warp'
+    ].map((word) => [word, word.toUpperCase()])
+  )
+
+  return key
+    .split(/[_-]/g)
+    .map((word) => acronyms.get(word) ?? word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
 }
 
 interface ScopeRow {
@@ -309,76 +326,21 @@ interface CategoryGroup {
   rows: ScopeRow[]
 }
 
-/**
- * High-level category each resource belongs to — mirrors the grouping on the
- * Cloudflare dashboard's API token screen. Unknown resources fall through to "Other".
- */
-const CATEGORY_MAP: Record<string, string> = {
-  offline_access: 'Core',
-  user: 'Core',
-  account: 'Core',
-  access: 'Access',
-  workers: 'Developer Platform',
-  workers_scripts: 'Developer Platform',
-  workers_kv: 'Developer Platform',
-  workers_routes: 'Developer Platform',
-  workers_tail: 'Developer Platform',
-  workers_deployments: 'Developer Platform',
-  workers_builds: 'Developer Platform',
-  workers_observability: 'Developer Platform',
-  workers_observability_telemetry: 'Developer Platform',
-  pages: 'Developer Platform',
-  d1: 'Developer Platform',
-  queues: 'Developer Platform',
-  pipelines: 'Developer Platform',
-  r2_catalog: 'Developer Platform',
-  vectorize: 'Developer Platform',
-  query_cache: 'Developer Platform',
-  secrets_store: 'Developer Platform',
-  containers: 'Developer Platform',
-  mcp_portals: 'Developer Platform',
-  ai: 'AI & Machine Learning',
-  aig: 'AI & Machine Learning',
-  aiaudit: 'AI & Machine Learning',
-  'ai-search': 'AI & Machine Learning',
-  dns_records: 'DNS & Zones',
-  dns_settings: 'DNS & Zones',
-  dns_analytics: 'DNS & Zones',
-  zone: 'DNS & Zones',
-  'account-ssl-and-certificates': 'DNS & Zones',
-  'ssl-and-certificates': 'DNS & Zones',
-  snippets: 'DNS & Zones',
-  logpush: 'Analytics & Logs',
-  auditlogs: 'Analytics & Logs',
-  'account-analytics': 'Analytics & Logs',
-  logs: 'Analytics & Logs',
-  lb: 'Networking',
-  notification: 'Networking',
-  connectivity: 'Networking',
-  teams: 'Cloudflare One / Zero Trust',
-  'sso-connector': 'Cloudflare One / Zero Trust',
-  cfone: 'Cloudflare One / Zero Trust',
-  dex: 'Cloudflare One / Zero Trust',
-  browser: 'Browser & Rendering',
-  url_scanner: 'App Security',
-  radar: 'App Security',
-  email_routing: 'Email & Messaging',
-  email_sending: 'Email & Messaging',
-  'registrar-domains': 'DNS & Zones'
-}
-
+/** Display order for the categories supplied by the public API catalog. */
 const CATEGORY_ORDER = [
   'Core',
-  'Access',
   'Developer Platform',
   'AI & Machine Learning',
   'DNS & Zones',
-  'Analytics & Logs',
-  'Networking',
-  'Browser & Rendering',
-  'Email & Messaging',
   'App Security',
+  'Rules & Configuration',
   'Cloudflare One / Zero Trust',
+  'Analytics & Logs',
+  'Network Services',
+  'Media',
+  'Email & Messaging',
+  'Cache & Performance',
+  'Account & Billing',
   'Other'
 ]
 
@@ -386,12 +348,13 @@ const CATEGORY_ORDER = [
  * Group scopes by resource, then bucket rows by category for accordion display.
  */
 function groupScopesByCategory(
-  allScopes: Record<string, string>,
+  scopeDefinitions: Record<string, ScopeDefinition>,
   requiredScopes: Set<string>
 ): CategoryGroup[] {
   const byResource = new Map<string, ScopeRow>()
 
-  for (const [scope, desc] of Object.entries(allScopes)) {
+  for (const [scope, definition] of Object.entries(scopeDefinitions)) {
+    const desc = definition.name
     let resource: string
     let action = 'grant'
     const splitScope = scope.split(/[:.]/)
@@ -402,11 +365,14 @@ function groupScopesByCategory(
       resource = splitScope[0]
     }
 
-    const category = CATEGORY_MAP[resource] ?? 'Other'
-    if (!byResource.has(resource)) {
-      byResource.set(resource, { resource, label: humanize(resource), category, actions: [] })
+    const category = definition.category
+    // The same resource can expose actions in different permission-group categories
+    // (for example, Pages access versus Page Shield). Keep those rows separate.
+    const resourceKey = `${category}\u0000${resource}`
+    if (!byResource.has(resourceKey)) {
+      byResource.set(resourceKey, { resource, label: humanize(resource), category, actions: [] })
     }
-    byResource.get(resource)!.actions.push({
+    byResource.get(resourceKey)!.actions.push({
       action,
       scope,
       desc,
@@ -416,15 +382,21 @@ function groupScopesByCategory(
 
   const actionRank: Record<string, number> = {
     read: 0,
+    metadata_read: 0,
+    monitoring: 0,
+    report: 0,
     write: 1,
     edit: 1,
+    index: 2,
     run: 2,
+    evaluate: 2,
+    send: 2,
     admin: 3,
     bind: 4,
-    setup: 5,
-    pii: 9,
-    secure_location: 9,
-    grant: -1
+    location: 5,
+    shield: 6,
+    purge: 7,
+    revoke: 8
   }
   for (const row of byResource.values()) {
     row.actions.sort((a, b) => {
@@ -456,15 +428,21 @@ function groupScopesByCategory(
 
 const ACTION_LABELS: Record<string, string> = {
   read: 'Read',
+  metadata_read: 'Metadata',
+  monitoring: 'Monitor',
+  report: 'Report',
   write: 'Write',
   edit: 'Edit',
+  index: 'Index',
   run: 'Run',
+  evaluate: 'Evaluate',
+  send: 'Send',
   admin: 'Admin',
   bind: 'Bind',
-  setup: 'Setup',
-  pii: 'PII',
-  secure_location: 'Locations',
-  grant: 'Grant'
+  location: 'Locations',
+  shield: 'Shield',
+  purge: 'Purge',
+  revoke: 'Revoke'
 }
 
 /**
@@ -476,17 +454,16 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
     state,
     csrfToken,
     setCookie,
-    scopeTemplates = {},
-    allScopes = {},
+    scopeTemplates,
+    scopeDefinitions,
     defaultTemplate,
-    maxScopes,
-    requiredScopes = []
+    requiredScopes
   } = options
 
   const encodedState = encodeBase64Utf8(JSON.stringify(state))
   const clientName = client?.clientName ? sanitizeHtml(client.clientName) : 'Unknown MCP Client'
   const requiredSet = new Set(requiredScopes)
-  const categories = groupScopesByCategory(allScopes, requiredSet)
+  const categories = groupScopesByCategory(scopeDefinitions, requiredSet)
 
   const renderRow = (row: ScopeRow): string => {
     const pills = row.actions
@@ -829,7 +806,6 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
       font-weight: 500;
       letter-spacing: -0.12px;
     }
-    .counter.warn { color: var(--cf-red); }
 
     /* Categories (accordions). Kumo 'permission policies' panel — match
        body canvas bg so the table looks recessed into the card. */
@@ -1105,7 +1081,7 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
                 </svg>
                 <input type="search" id="search" placeholder="Search for permission groups..." autocomplete="off">
               </div>
-              <div class="counter" id="counter"><strong>0</strong> / ${maxScopes ?? Object.keys(allScopes).length}</div>
+              <div class="counter" id="counter"><strong>0</strong> / ${Object.keys(scopeDefinitions).length}</div>
             </div>
             <div class="categories" id="matrix">
               ${categoriesHtml}
@@ -1138,9 +1114,8 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
       const TEMPLATES = ${templateDataJson};
       const TEMPLATE_META = ${templateMetaJson};
       const DEFAULT_TEMPLATE = ${JSON.stringify(defaultTemplate ?? null)};
-      const MAX_SCOPES = ${maxScopes ?? 0};
       const REQUIRED = new Set(${JSON.stringify(Array.from(requiredSet))});
-      const ALL_SCOPES = new Set(${JSON.stringify(Object.keys(allScopes))});
+      const ALL_SCOPES = new Set(${JSON.stringify(Object.keys(scopeDefinitions))});
       const LS_KEY = 'cf-mcp-consent:user-templates:v1';
 
       const selected = new Set();
@@ -1296,27 +1271,13 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
           const scope = pill.dataset.scope;
           pill.setAttribute('aria-pressed', selected.has(scope) ? 'true' : 'false');
         });
-        enforceLimit();
         updateCounter();
         updateCategoryCounts();
         renderHiddenInputs();
       }
 
-      function enforceLimit() {
-        if (!MAX_SCOPES) return;
-        const atMax = selected.size >= MAX_SCOPES;
-        matrixEl.querySelectorAll('.pill').forEach(pill => {
-          if (pill.dataset.required) return;
-          const scope = pill.dataset.scope;
-          pill.disabled = !selected.has(scope) && atMax;
-        });
-      }
-
       function updateCounter() {
-        const count = selected.size;
-        const max = MAX_SCOPES || ALL_SCOPES.size;
-        counterEl.innerHTML = '<strong>' + count + '</strong> / ' + max;
-        counterEl.classList.toggle('warn', MAX_SCOPES > 0 && count >= MAX_SCOPES);
+        counterEl.innerHTML = '<strong>' + selected.size + '</strong> / ' + ALL_SCOPES.size;
       }
 
       function updateCategoryCounts() {

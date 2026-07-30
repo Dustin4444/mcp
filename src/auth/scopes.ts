@@ -1,172 +1,71 @@
-/**
- * All available OAuth scopes for the Cloudflare API MCP server.
- * If you need to add a new scope, first register it with the OAuth provider, then add it here.
- * Run tests to validate: npm test
- */
-export const ALL_SCOPES = {
-  // Core (required for basic functionality)
-  offline_access: 'Grants refresh tokens for long-lived access',
-  'user:read': 'See your user info such as name, email address, and account memberships',
-  'account:read': 'See your account info such as account details, analytics, and memberships',
+import { DERIVED_OAUTH_SCOPES, type ScopeDefinition } from './derived-oauth-scopes'
 
-  // Access
-  'access:read': 'View Access policies',
-  'access:write': 'Configure Access policies',
+const CORE_SCOPE_DEFINITIONS = {
+  offline_access: {
+    name: 'Offline access',
+    category: 'Core'
+  },
+  'user:read': {
+    name: 'User Read',
+    category: 'Core'
+  },
+  'account:read': {
+    name: 'Account Read',
+    category: 'Core'
+  }
+} as const satisfies Record<string, ScopeDefinition>
 
-  // Workers Platform
-  'workers:read': 'See Cloudflare Workers data',
-  'workers:write': 'Create and modify Cloudflare Workers',
-  'workers_scripts:write': 'Upload and modify Worker scripts',
-  'workers_kv:write': 'Create and modify KV namespaces and data',
-  'workers_routes:write': 'Configure Worker routes',
-  'workers_tail:read': 'View Worker logs via tail',
-  'workers_deployments:read': 'View Worker deployment history and status',
-  'workers_builds:read': 'View Worker builds',
-  'workers_builds:write': 'Trigger Worker builds',
-  'workers_observability:read': 'View Worker metrics and traces',
-  'workers_observability:write': 'Configure Worker observability',
-  'workers_observability_telemetry:write': 'Write Worker telemetry data',
+export type ScopeName = keyof typeof CORE_SCOPE_DEFINITIONS | keyof typeof DERIVED_OAUTH_SCOPES
 
-  // Pages & D1
-  'pages:read': 'View Cloudflare Pages projects',
-  'pages:write': 'Create and modify Cloudflare Pages projects',
-  'd1:write': 'Create and modify D1 databases',
+export interface ScopeTemplate {
+  name: string
+  description: string
+  scopes: readonly ScopeName[]
+}
 
-  // AI & Machine Learning
-  'ai:read': 'View AI models and inference results',
-  'ai:write': 'Run AI inference',
-  'aig:read': 'View AI Gateway configurations',
-  'aig:write': 'Configure AI Gateway',
-  'aiaudit:read': 'View AI audit logs',
-  'aiaudit:write': 'Configure AI auditing',
-  'ai-search:read': 'View AI Search configurations',
-  'ai-search:write': 'Configure AI Search',
-  'ai-search:run': 'Execute AI Search queries',
+/** Scopes required for identity, account discovery, and refresh tokens. */
+export const REQUIRED_SCOPES = [
+  'user:read',
+  'offline_access',
+  'account:read'
+] as const satisfies readonly ScopeName[]
 
-  // DNS Management
-  'dns_records:read': 'View DNS records',
-  'dns_records:edit': 'Create and modify DNS records',
-  'dns_settings:read': 'View DNS settings',
-  'dns_analytics:read': 'View DNS analytics',
-  'zone:read': 'View zone configurations',
+/** The two built-in permission presets. */
+export type TemplateName = 'read-only' | 'full-access'
 
-  // Observability & Logging
-  'logpush:read': 'View Logpush jobs',
-  'logpush:write': 'Configure Logpush jobs',
-  'auditlogs:read': 'View audit logs',
-  'account-analytics.read': 'View account analytics such as RUM and Web Analytics data',
-  'logs.read': 'View logs',
-  'logs.write': 'Manage logs',
+/** Default template; read-only is safest. */
+export const DEFAULT_TEMPLATE: TemplateName = 'read-only'
 
-  // Infrastructure & Networking
-  'account-ssl-and-certificates.write': 'Manage account-level SSL certificates',
-  'ssl-and-certificates.read': 'View zone-level SSL certificates and configuration',
-  'ssl-and-certificates.write': 'Manage zone-level SSL certificates and configuration',
-  'lb:read': 'View load balancer configurations',
-  'lb:edit': 'Configure load balancers',
-  'notification:read': 'View notification policies',
-  'notification:write': 'Configure notifications',
+function isReadOnlyScope(scope: string): boolean {
+  const action = scope.split(/[:.]/).at(-1)
+  return (
+    action === 'read' ||
+    action === 'metadata_read' ||
+    action === 'monitoring' ||
+    action === 'report'
+  )
+}
 
-  // Queues & Pipelines
-  'queues:write': 'Create and modify Queues',
-  'pipelines:read': 'View Pipeline configurations',
-  'pipelines:setup': 'Set up Pipelines',
-  'pipelines:write': 'Modify Pipelines',
+/** Canonical production catalog plus required OAuth bootstrap scopes. */
+export const SCOPE_DEFINITIONS: Record<string, ScopeDefinition> = {
+  ...CORE_SCOPE_DEFINITIONS,
+  ...DERIVED_OAUTH_SCOPES
+}
 
-  // Storage & Data
-  'r2_catalog:write': 'Manage R2 buckets and objects',
-  'vectorize:write': 'Create and modify Vectorize indexes',
-  'query_cache:write': 'Configure query cache',
-  'secrets_store:read': 'View secrets',
-  'secrets_store:write': 'Create and modify secrets',
-
-  // Browser & Containers
-  'browser:read': 'View Browser Rendering configurations',
-  'browser:write': 'Configure Browser Rendering',
-  'containers:write': 'Manage containers',
-
-  // Teams & Security
-  'teams:read': 'View Cloudflare Zero Trust configurations',
-  'teams:write': 'Configure Cloudflare Zero Trust',
-  'teams:pii': 'Access PII in Zero Trust logs',
-  'teams:secure_location': 'Manage secure locations',
-  'sso-connector:read': 'View SSO connectors',
-  'sso-connector:write': 'Configure SSO connectors',
-
-  // Connectivity
-  'connectivity:admin': 'Full connectivity administration',
-  'connectivity:bind': 'Bind connectivity resources',
-  'connectivity:read': 'View connectivity configurations',
-
-  // Cloudflare One
-  'cfone:read': 'View Cloudflare One configurations',
-  'cfone:write': 'Configure Cloudflare One',
-
-  // DEX (Digital Experience)
-  'dex:read': 'View DEX configurations',
-  'dex:write': 'Configure DEX',
-
-  // URL Scanner & Radar
-  'url_scanner:read': 'View URL Scanner results',
-  'url_scanner:write': 'Configure URL Scanner',
-  'radar:read': 'View Radar threat intelligence',
-
-  // MCP Portals
-  'mcp_portals:read': 'View MCP Portal configurations',
-  'mcp_portals:write': 'Create and modify MCP Portals',
-
-  // Email
-  'email_routing:write': 'Configure email routing rules',
-  'email_sending:write': 'Send emails via Email Workers',
-
-  // Registrar
-  'registrar-domains.read': 'View existing & new Registrar domains',
-  'registrar-domains.admin': 'Manage existing & new Registrar domains',
-
-  // Snippets
-  'snippets.read': 'View Snippets',
-  'snippets.write': 'Create and modify Snippets'
-} as const
-
-/**
- * Maximum number of scopes that can be requested in a single OAuth authorization.
- * Undefined means the MCP server does not impose an app-side scope cap.
- */
-export const MAX_SCOPES: number | undefined = undefined
-
-export type ScopeName = keyof typeof ALL_SCOPES
-
-/** Scopes required for basic functionality - always included */
-export const REQUIRED_SCOPES: ScopeName[] = ['user:read', 'offline_access', 'account:read']
-
-const yoloScopes = (Object.keys(ALL_SCOPES) as ScopeName[]).filter(
-  (scope) => !['teams:pii', 'logs.write', 'ssl-and-certificates.read'].includes(scope)
-)
-
+const scopeNames = Object.keys(SCOPE_DEFINITIONS) as ScopeName[]
 const readOnlyScopes = Array.from(
-  new Set<ScopeName>([
-    ...REQUIRED_SCOPES,
-    ...(Object.keys(ALL_SCOPES) as ScopeName[]).filter((s) => s.match(/[.:]read$/))
-  ])
+  new Set<ScopeName>([...REQUIRED_SCOPES, ...scopeNames.filter(isReadOnlyScope)])
 )
-
-/** Scope templates for quick selection. `custom` is surfaced client-side only. */
-export const SCOPE_TEMPLATES = {
+export const SCOPE_TEMPLATES: Record<TemplateName, ScopeTemplate> = {
   'read-only': {
     name: 'Read only',
     description:
       'View resources without making changes. Safest for exploration and read workflows.',
     scopes: readOnlyScopes
   },
-  yolo: {
+  'full-access': {
     name: 'Full access',
-    description:
-      'Everything the MCP server can do. Skips sensitive PII and deprecated scopes. Use with trusted clients only.',
-    scopes: yoloScopes
+    description: 'Every OAuth scope available to the MCP server. Use with trusted clients only.',
+    scopes: scopeNames
   }
-} as const
-
-export type TemplateName = keyof typeof SCOPE_TEMPLATES
-
-/** Default template - read only is safest */
-export const DEFAULT_TEMPLATE: TemplateName = 'read-only'
+}

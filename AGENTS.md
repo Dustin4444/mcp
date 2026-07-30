@@ -30,7 +30,8 @@ cloudflare-mcp/
 │   │   ├── api-token-mode.ts      # Direct Cloudflare API token support
 │   │   ├── cloudflare-auth.ts     # PKCE & OAuth utilities
 │   │   ├── oauth-handler.ts       # OAuth authorization flow
-│   │   ├── scopes.ts              # OAuth scope definitions (120+ scopes)
+│   │   ├── derived-oauth-scopes.ts # Canonical production OAuth scope API metadata
+│   │   ├── scopes.ts              # Canonical picker config and OAuth bootstrap scopes
 │   │   └── workers-oauth-utils.ts # OAuth provider helpers
 ├── tests/                         # Vitest suite (top-level, mirrors src/)
 │   ├── index.test.ts
@@ -124,7 +125,7 @@ Two modes via Zod discriminated union (`AuthProps`):
 - **OAuth mode** (default): Uses `@cloudflare/workers-oauth-provider` with PKCE. Supports both account-scoped and user-scoped tokens.
 - **API token mode**: Direct Cloudflare API tokens bypass OAuth. Detection: OAuth tokens have 3 colon-separated parts; API tokens don't.
 
-Max 76 OAuth scopes enforced (Cloudflare server limitation).
+The consent picker uses the production catalog returned by `GET /oauth/scopes` in every deployment. Staging may register additional scopes, but the MCP picker exposes them only after they reach production. Only the user, account, and offline-access OAuth bootstrap scopes sit outside the API catalog. Terraform registration must land before deploying picker additions. The app does not impose a scope-count cap.
 
 ### OpenAPI spec processing
 
