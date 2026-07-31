@@ -20,6 +20,8 @@ import { server } from '../setup/msw'
 
 const REDIRECT_URI = 'https://app.example.com/cb'
 const MCP_ORIGIN = 'https://mcp.cloudflare.com'
+const DOWNSTREAM_CODE_VERIFIER = 'test-downstream-code-verifier'
+const DOWNSTREAM_CODE_CHALLENGE = 'I4fhllfHqqQsgap17V2SDI0scSei8H7U0e0rZBDIcbo'
 
 /** Register a client via the provider's RFC 7591 endpoint; returns its id. */
 async function registerClient(): Promise<string> {
@@ -40,6 +42,8 @@ async function registerClient(): Promise<string> {
 function authorizeUrl(params: Record<string, string>): string {
   const u = new URL(`${MCP_ORIGIN}/authorize`)
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v)
+  u.searchParams.set('code_challenge', DOWNSTREAM_CODE_CHALLENGE)
+  u.searchParams.set('code_challenge_method', 'S256')
   return u.toString()
 }
 
@@ -47,6 +51,12 @@ function embeddedTemplateScopes(html: string): Record<string, string[]> {
   const encoded = html.match(/const TEMPLATES = ([^;]+);/)?.[1]
   expect(encoded).toBeTruthy()
   return JSON.parse(encoded!) as Record<string, string[]>
+}
+
+function embeddedInitialScopes(html: string): string[] {
+  const encoded = html.match(/const INITIAL_SCOPES = ([^;]+);/)?.[1]
+  expect(encoded).toBeTruthy()
+  return JSON.parse(encoded!) as string[]
 }
 
 async function beginAuthorization(options: { state?: string; scopes?: string } = {}): Promise<{
@@ -62,7 +72,7 @@ async function beginAuthorization(options: { state?: string; scopes?: string } =
         response_type: 'code',
         client_id: clientId,
         redirect_uri: REDIRECT_URI,
-        scope: 'user:read',
+        scope: options.scopes ?? 'user:read',
         ...(options.state === undefined ? {} : { state: options.state })
       })
     )
@@ -95,14 +105,14 @@ async function beginAuthorization(options: { state?: string; scopes?: string } =
   }
 }
 
-function useCloudflareAuthSuccess(): void {
+function useCloudflareAuthSuccess(scope = 'user:read'): void {
   server.use(
     http.post('https://dash.cloudflare.com/oauth2/token', () =>
       HttpResponse.json({
         access_token: 'access-token',
         expires_in: 3600,
         refresh_token: 'refresh-token',
-        scope: 'user:read',
+        scope,
         token_type: 'bearer'
       })
     ),
@@ -181,6 +191,66 @@ describe('GET /authorize', () => {
     expect(templates['full-access']).not.toContain('realtime.realtime')
     // Happy path emits no auth_user event.
     expect(writtenEvents(metricsSpy)).not.toContain('auth_user')
+  })
+
+  it('preserves valid requested scopes and preselects them with required scopes', async () => {
+    const clientId = await registerClient()
+    const response = await exports.default.fetch(
+      new Request(
+        authorizeUrl({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          scope: 'access.write'
+        })
+      )
+    )
+
+    expect(response.status).toBe(200)
+    expect(embeddedInitialScopes(await response.text())).toEqual([
+      'access.write',
+      'user:read',
+      'offline_access',
+      'account:read'
+    ])
+  })
+
+  it('rejects unknown requested scopes instead of silently downgrading them', async () => {
+    const clientId = await registerClient()
+    const response = await exports.default.fetch(
+      new Request(
+        authorizeUrl({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          scope: 'access:write'
+        })
+      )
+    )
+
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain('Unknown OAuth scope: access:write')
+  })
+
+  it('always shows consent, including for repeated read-only requests', async () => {
+    const clientId = await registerClient()
+    const request = () =>
+      new Request(
+        authorizeUrl({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          scope: 'user:read'
+        })
+      )
+
+    const firstResponse = await exports.default.fetch(request())
+    const secondResponse = await exports.default.fetch(request())
+
+    expect(firstResponse.status).toBe(200)
+    expect(secondResponse.status).toBe(200)
+    expect(await firstResponse.text()).toContain('<form')
+    expect(await secondResponse.text()).toContain('<form')
   })
 
   it('silently drops stale custom-template scopes outside the catalog', async () => {
@@ -286,6 +356,45 @@ describe('GET /oauth/callback', () => {
     expect(dp.blobs?.[3]).toBeFalsy()
   })
 
+  it('carries a requested write scope through the complete OAuth exchange', async () => {
+    const { clientId, state, sessionCookie, location } = await beginAuthorization({
+      scopes: 'access.write'
+    })
+    const upstreamScopes = new URL(location).searchParams.get('scope')?.split(' ') ?? []
+    expect(upstreamScopes).toEqual(
+      expect.arrayContaining(['access.write', 'user:read', 'account:read', 'offline_access'])
+    )
+
+    useCloudflareAuthSuccess('access.write user:read account:read offline_access')
+    const callback = await exports.default.fetch(
+      new Request(`${MCP_ORIGIN}/oauth/callback?code=authcode&state=${encodeURIComponent(state)}`, {
+        headers: { Cookie: sessionCookie },
+        redirect: 'manual'
+      })
+    )
+    const code = new URL(callback.headers.get('location')!).searchParams.get('code')
+    expect(code).toBeTruthy()
+
+    const tokenResponse = await exports.default.fetch(
+      new Request(`${MCP_ORIGIN}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code: code!,
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          code_verifier: DOWNSTREAM_CODE_VERIFIER
+        }).toString()
+      })
+    )
+    expect(tokenResponse.status).toBe(200)
+    const token = (await tokenResponse.json()) as { scope: string }
+    expect(token.scope.split(' ')).toEqual(
+      expect.arrayContaining(['access.write', 'user:read', 'account:read', 'offline_access'])
+    )
+  })
+
   it('serves modern MCP from provider-issued authenticated props', async () => {
     const { clientId, state, sessionCookie } = await beginAuthorization()
     useCloudflareAuthSuccess()
@@ -306,7 +415,8 @@ describe('GET /oauth/callback', () => {
           grant_type: 'authorization_code',
           code: code!,
           client_id: clientId,
-          redirect_uri: REDIRECT_URI
+          redirect_uri: REDIRECT_URI,
+          code_verifier: DOWNSTREAM_CODE_VERIFIER
         }).toString()
       })
     )
