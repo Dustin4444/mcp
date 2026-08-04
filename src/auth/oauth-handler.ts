@@ -8,16 +8,7 @@ import {
   refreshAuthToken
 } from './cloudflare-auth'
 import { DEFAULT_TEMPLATE, REQUIRED_SCOPES, SCOPE_DEFINITIONS, SCOPE_TEMPLATES } from './scopes'
-import {
-  UserSchema,
-  AccountsSchema,
-  AuthProps as AuthPropsSchema,
-  AUTH_PROPS_VERSION,
-  ACCOUNTS_PROBE_PAGE_SIZE,
-  MAX_STORED_ACCOUNTS,
-  type AuthProps,
-  type AccountSchema
-} from './types'
+import { AuthProps as AuthPropsSchema, AUTH_PROPS_VERSION, type AuthProps } from './types'
 import {
   createOAuthState,
   bindStateToSession,
@@ -28,7 +19,8 @@ import {
   validateOAuthState,
   OAuthError
 } from './workers-oauth-utils'
-import { fetchWithRetry } from '../utils/fetch-retry'
+import { getCloudflareOAuthUser } from './cloudflare-identity'
+import { withRefreshAdmission } from './refresh-admission-gate'
 import { MetricsTracker, AuthUser } from '../metrics'
 import { SERVER_INFO } from '../constants'
 
@@ -45,8 +37,6 @@ interface AuthEnv extends Env {
 
 const env = cloudflareEnv as AuthEnv
 const ALLOWED_SCOPES = new Set(Object.keys(SCOPE_DEFINITIONS))
-const REFRESH_GUARD_PREFIX = 'oauth:refresh-guard'
-
 const metrics = new MetricsTracker(env.MCP_METRICS, SERVER_INFO)
 
 /** Format an unknown thrown value into a stable `auth_user` error message. */
@@ -61,438 +51,30 @@ function authErrorMessage(prefix: string, e: unknown): string {
   }
   return `${prefix}: ${message}`
 }
-const REFRESH_IN_FLIGHT_TTL_SECONDS = 60
-const REFRESH_FAILURE_TTL_SECONDS = 3600
-const refreshInFlight = new Map<string, Promise<TokenExchangeCallbackResult | undefined>>()
-
-async function sha256Hex(value: string): Promise<string> {
-  const data = new TextEncoder().encode(value)
-  const digest = await crypto.subtle.digest('SHA-256', data)
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('')
-}
-
-function refreshGuardKeys(refreshTokenHash: string): { inFlight: string; failure: string } {
-  return {
-    inFlight: `${REFRESH_GUARD_PREFIX}:${refreshTokenHash}:in-flight`,
-    failure: `${REFRESH_GUARD_PREFIX}:${refreshTokenHash}:failure`
-  }
-}
-
-function isTerminalRefreshError(error: unknown): error is OAuthError {
-  return (
-    error instanceof OAuthError &&
-    ['invalid_grant', 'invalid_client', 'unauthorized_client'].includes(error.code)
-  )
-}
 
 /**
- * Context needed to kill the downstream grant + emit telemetry when an upstream
- * refresh fails. Optional so the guard stays usable in isolation (tests).
- */
-export interface RefreshGuardContext {
-  /** Downstream OAuth user id (from the token-exchange callback options). */
-  userId?: string
-  /** Downstream OAuth client id (from the token-exchange callback options). */
-  clientId?: string
-  /** Exact downstream grant being refreshed. */
-  grantId?: string
-  /**
-   * Lazily builds OAuth helpers (via `getOAuthApi`). Only invoked on a terminal
-   * `invalid_grant` so we don't construct the provider on every refresh.
-   */
-  getHelpers?: () => OAuthHelpers
-}
-
-type RefreshFailureKind = 'upstream_terminal' | 'cached_replay' | 'in_flight_collision'
-
-/**
- * Structured, greppable telemetry for refresh failures. Logged as a single JSON
- * line prefixed with `[refresh-telemetry]` so it can be counted in Workers Logs.
- *
- * `kind` distinguishes the cases you want to measure:
- *  - `upstream_terminal`: upstream /oauth2/token actually returned a terminal
- *    error this request (the *first-time* failure). `grantsRevoked` tells you
- *    whether we killed the grant.
- *  - `cached_replay`: a retry that short-circuited on the cached failure within
- *    REFRESH_FAILURE_TTL_SECONDS (a *repeat*, never hit upstream).
- *  - `in_flight_collision`: another isolate was mid-refresh.
- */
-function logRefreshTelemetry(event: {
-  kind: RefreshFailureKind
-  code: string
-  refreshTokenHash: string
-  userId?: string
-  clientId?: string
-  grantsRevoked?: number
-}): void {
-  console.error(`[refresh-telemetry] ${JSON.stringify({ ...event, at: Date.now() })}`)
-}
-
-async function getCachedRefreshFailure(
-  kv: KVNamespace,
-  failureKey: string
-): Promise<{
-  code?: string
-  description?: string
-  statusCode?: number
-  headers?: Record<string, string>
-} | null> {
-  try {
-    const failure = await kv.get(failureKey, { type: 'json' })
-    if (!failure || typeof failure !== 'object') return null
-    return failure as {
-      code?: string
-      description?: string
-      statusCode?: number
-      headers?: Record<string, string>
-    }
-  } catch (error) {
-    console.warn('Refresh guard: failed to read cached refresh failure', error)
-    return null
-  }
-}
-
-async function isRefreshInFlight(kv: KVNamespace, inFlightKey: string): Promise<boolean> {
-  try {
-    return Boolean(await kv.get(inFlightKey))
-  } catch (error) {
-    console.warn('Refresh guard: failed to read in-flight marker', error)
-    return false
-  }
-}
-
-async function markRefreshInFlight(kv: KVNamespace, inFlightKey: string): Promise<void> {
-  try {
-    await kv.put(inFlightKey, JSON.stringify({ startedAt: Date.now() }), {
-      expirationTtl: REFRESH_IN_FLIGHT_TTL_SECONDS
-    })
-  } catch (error) {
-    console.warn('Refresh guard: failed to write in-flight marker', error)
-  }
-}
-
-async function cacheRefreshFailure(
-  kv: KVNamespace,
-  failureKey: string,
-  error: OAuthError
-): Promise<void> {
-  try {
-    await kv.put(
-      failureKey,
-      JSON.stringify({
-        code: error.code,
-        description: 'Token refresh failed; reauthorization is required',
-        // Preserve the upstream status + headers so a cached replay returns the
-        // same response as the original failure (e.g. 401 invalid_client, or a
-        // 429 with Retry-After) instead of a flat 400 with no headers.
-        statusCode: error.statusCode,
-        headers: error.headers,
-        failedAt: Date.now()
-      }),
-      { expirationTtl: REFRESH_FAILURE_TTL_SECONDS }
-    )
-  } catch (cacheError) {
-    console.warn('Refresh guard: failed to cache terminal refresh failure', cacheError)
-  }
-}
-
-async function clearRefreshInFlight(kv: KVNamespace, inFlightKey: string): Promise<void> {
-  try {
-    await kv.delete(inFlightKey)
-  } catch (error) {
-    console.warn('Refresh guard: failed to clear in-flight marker', error)
-  }
-}
-
-export async function guardRefreshTokenExchange(
-  kv: KVNamespace,
-  refreshToken: string,
-  refresh: () => Promise<TokenExchangeCallbackResult | undefined>,
-  context: RefreshGuardContext = {}
-): Promise<TokenExchangeCallbackResult | undefined> {
-  const refreshTokenHash = await sha256Hex(refreshToken)
-  const keys = refreshGuardKeys(refreshTokenHash)
-  const existingRefresh = refreshInFlight.get(refreshTokenHash)
-  if (existingRefresh) return existingRefresh
-
-  const refreshPromise = (async () => {
-    try {
-      const cachedFailure = await getCachedRefreshFailure(kv, keys.failure)
-      if (cachedFailure) {
-        const code = cachedFailure.code || 'invalid_grant'
-        // A retry of an already-failed token within the cache TTL. The grant was
-        // already killed on the first failure; this never reaches upstream.
-        logRefreshTelemetry({
-          kind: 'cached_replay',
-          code,
-          refreshTokenHash,
-          userId: context.userId,
-          clientId: context.clientId
-        })
-        throw new OAuthError(
-          code,
-          cachedFailure.description || 'Token refresh recently failed; reauthorization is required',
-          cachedFailure.statusCode ?? 400,
-          cachedFailure.headers ?? {}
-        )
-      }
-
-      if (await isRefreshInFlight(kv, keys.inFlight)) {
-        logRefreshTelemetry({
-          kind: 'in_flight_collision',
-          code: 'temporarily_unavailable',
-          refreshTokenHash,
-          userId: context.userId,
-          clientId: context.clientId
-        })
-        throw new OAuthError(
-          'temporarily_unavailable',
-          'Token refresh is already in progress; retry shortly',
-          429,
-          { 'Retry-After': '30' }
-        )
-      }
-
-      await markRefreshInFlight(kv, keys.inFlight)
-
-      try {
-        return await refresh()
-      } catch (error) {
-        if (isTerminalRefreshError(error)) {
-          await cacheRefreshFailure(kv, keys.failure, error)
-
-          // The core fix: when upstream rejects the stored refresh token with
-          // invalid_grant it is permanently dead, so kill the downstream grant
-          // and force re-auth instead of letting the client retry forever.
-          // Other terminal codes (invalid_client/unauthorized_client) are
-          // server-side credential problems that revoking wouldn't fix.
-          let grantsRevoked = 0
-          if (
-            error.code === 'invalid_grant' &&
-            context.userId &&
-            context.grantId &&
-            context.getHelpers
-          ) {
-            try {
-              await context.getHelpers().revokeGrant(context.grantId, context.userId)
-              grantsRevoked = 1
-            } catch (revokeError) {
-              console.error(
-                'Refresh guard: failed to revoke grant after invalid_grant',
-                revokeError
-              )
-            }
-          }
-
-          logRefreshTelemetry({
-            kind: 'upstream_terminal',
-            code: error.code,
-            refreshTokenHash,
-            userId: context.userId,
-            clientId: context.clientId,
-            grantsRevoked
-          })
-        }
-        throw error
-      } finally {
-        await clearRefreshInFlight(kv, keys.inFlight)
-      }
-    } finally {
-      refreshInFlight.delete(refreshTokenHash)
-    }
-  })()
-
-  refreshInFlight.set(refreshTokenHash, refreshPromise)
-  return refreshPromise
-}
-
-function getRetryAfterHeader(...responses: Response[]): Record<string, string> {
-  return {
-    'Retry-After':
-      responses.find((response) => response.status === 429)?.headers.get('Retry-After') ?? '30'
-  }
-}
-
-function throwCombinedCloudflareApiError(userResp: Response, accountsResp: Response): never {
-  const statuses = [userResp.status, accountsResp.status]
-
-  if (statuses.some((status) => status >= 500)) {
-    throw new OAuthError('server_error', 'Cloudflare API is temporarily unavailable', 502)
-  }
-
-  if (statuses.includes(429)) {
-    throw new OAuthError('temporarily_unavailable', 'Rate limited, try again later', 429, {
-      ...getRetryAfterHeader(userResp, accountsResp)
-    })
-  }
-
-  if (statuses.includes(401)) {
-    throw new OAuthError('invalid_token', 'Access token is invalid or expired', 401)
-  }
-
-  if (statuses.includes(403)) {
-    throw new OAuthError('insufficient_scope', 'Insufficient permissions', 403)
-  }
-
-  throw new OAuthError('invalid_token', 'Failed to verify token', userResp.status)
-}
-
-async function fetchCloudflareProbes(
-  accessToken: string,
-  caller = 'oauth_callback_identity_probe'
-): Promise<[Response, Response]> {
-  const headers = { Authorization: `Bearer ${accessToken}` }
-
-  try {
-    return await Promise.all([
-      fetchWithRetry(`${env.CLOUDFLARE_API_BASE}/user`, { headers }, { caller }),
-      fetchWithRetry(
-        `${env.CLOUDFLARE_API_BASE}/accounts?per_page=${ACCOUNTS_PROBE_PAGE_SIZE}`,
-        { headers },
-        { caller }
-      )
-    ])
-  } catch (error) {
-    console.error('Cloudflare API request failed', error)
-    throw new OAuthError('server_error', 'Cloudflare API is temporarily unavailable', 502)
-  }
-}
-
-/**
- * Fetch user and accounts from Cloudflare API
- */
-export async function getUserAndAccounts(
-  accessToken: string,
-  caller = 'oauth_callback_identity_probe'
-): Promise<{
-  user: UserSchema | null
-  accounts: AccountSchema[]
-  accountCount?: number
-}> {
-  const [userResp, accountsResp] = await fetchCloudflareProbes(accessToken, caller)
-
-  // Check for upstream errors before parsing
-  if (!userResp.ok && !accountsResp.ok) {
-    console.error(`Cloudflare API error: user=${userResp.status}, accounts=${accountsResp.status}`)
-    throwCombinedCloudflareApiError(userResp, accountsResp)
-  }
-
-  // Parse user from response
-  let user: UserSchema | null = null
-  if (userResp.ok) {
-    try {
-      const json = (await userResp.json()) as { success?: boolean; result?: unknown }
-      if (json.success && json.result) {
-        const parsed = UserSchema.safeParse(json.result)
-        if (parsed.success) {
-          user = parsed.data
-        } else {
-          console.error('Cloudflare API /user payload did not match expected shape', parsed.error)
-        }
-      }
-    } catch (error) {
-      console.error('Cloudflare API /user response is not valid JSON', error)
-    }
-  }
-
-  // Parse accounts from response
-  let accounts: AccountSchema[] = []
-  let totalAccountCount: number | undefined
-  if (accountsResp.ok) {
-    try {
-      const json = (await accountsResp.json()) as {
-        success?: boolean
-        result?: unknown
-        result_info?: { count?: unknown; total_count?: unknown }
-      }
-      if (json.success && json.result) {
-        const parsed = AccountsSchema.safeParse(json.result)
-        if (parsed.success) {
-          accounts = parsed.data
-          const reported = json.result_info?.total_count
-          if (typeof reported === 'number' && Number.isFinite(reported) && reported >= 0) {
-            totalAccountCount = reported
-          } else {
-            const pageCount = json.result_info?.count
-            totalAccountCount =
-              typeof pageCount === 'number' && Number.isFinite(pageCount) && pageCount >= 0
-                ? Math.max(pageCount, accounts.length)
-                : accounts.length
-            console.warn(
-              `Cloudflare API /accounts response is missing a valid result_info.total_count; ` +
-                `falling back to page count ${totalAccountCount}`
-            )
-          }
-        } else {
-          console.error(
-            'Cloudflare API /accounts payload did not match expected shape',
-            parsed.error
-          )
-        }
-      }
-    } catch (error) {
-      console.error('Cloudflare API /accounts response is not valid JSON', error)
-    }
-  }
-
-  if (user) {
-    // Don't persist a long account list. Prefer the API-reported total; the
-    // page count fallback preserves availability if pagination metadata drifts.
-    if (totalAccountCount !== undefined && totalAccountCount > MAX_STORED_ACCOUNTS) {
-      return { user, accounts: [], accountCount: totalAccountCount }
-    }
-    return { user, accounts }
-  }
-
-  // Account-scoped token - user will be null
-  if (accounts.length > 0) {
-    return { user: null, accounts }
-  }
-
-  throw new OAuthError(
-    'invalid_token',
-    'Failed to verify token: no user or account information',
-    401
-  )
-}
-
-/**
- * Handle token refresh for workers-oauth-provider.
- *
- * Throws the local `OAuthError` (which extends the provider's exported
- * `OAuthError`) for intentional refresh failures so workers-oauth-provider
- * converts them into structured `/token` responses.
+ * Refresh the upstream Cloudflare grant when workers-oauth-provider refreshes
+ * its downstream access token. The per-grant admission gate rejects competing
+ * provider exchanges so they cannot independently rotate downstream tokens.
  */
 export async function handleTokenExchangeCallback(
   options: TokenExchangeCallbackOptions,
   clientId: string,
   clientSecret: string,
-  /**
-   * Lazily builds OAuth helpers so we can revoke the downstream grant when the
-   * upstream refresh token is rejected with `invalid_grant`. Wired from
-   * `index.ts` (the only place with the full provider options needed by
-   * `getOAuthApi`). Optional so existing callers/tests keep working.
-   */
   getHelpers?: () => OAuthHelpers
 ): Promise<TokenExchangeCallbackResult | undefined> {
-  if (options.grantType !== 'refresh_token') {
-    return undefined
-  }
+  if (options.grantType !== 'refresh_token') return undefined
 
   const props = AuthPropsSchema.parse(options.props)
-
-  if (props.type !== 'user_token' || !props.refreshToken) {
-    return undefined
+  if (props.type !== 'user_token' || !props.refreshToken) return undefined
+  if (!options.userId || !options.grantId) {
+    throw new Error('Refresh token exchange is missing its grant identity')
   }
-
+  const grant = { userId: options.userId, grantId: options.grantId }
   const upstreamRefreshToken = props.refreshToken
 
-  return guardRefreshTokenExchange(
-    env.OAUTH_KV,
-    upstreamRefreshToken,
-    async () => {
+  try {
+    return await withRefreshAdmission(env.OAUTH_KV, grant, async () => {
       const { access_token, refresh_token, expires_in } = await refreshAuthToken({
         client_id: clientId,
         client_secret: clientSecret,
@@ -508,14 +90,25 @@ export async function handleTokenExchangeCallback(
         } satisfies AuthProps,
         accessTokenTTL: expires_in
       }
-    },
-    {
-      userId: options.userId,
-      clientId: options.clientId,
-      grantId: options.grantId,
+    })
+  } catch (error) {
+    // A genuine upstream invalid_grant is permanent. Revoke only this exact
+    // downstream grant so the client reauthorizes instead of retrying forever.
+    if (
+      error instanceof OAuthError &&
+      error.code === 'invalid_grant' &&
+      options.userId &&
+      options.grantId &&
       getHelpers
+    ) {
+      try {
+        await getHelpers().revokeGrant(options.grantId, options.userId)
+      } catch (revokeError) {
+        console.error('Failed to revoke grant after upstream invalid_grant', revokeError)
+      }
     }
-  )
+    throw error
+  }
 }
 
 /**
@@ -691,36 +284,26 @@ export function createAuthHandlers() {
         })
       ])
 
-      // Fetch user and accounts
-      const { user, accounts, accountCount } = await getUserAndAccounts(access_token)
-
-      // Account-scoped tokens (user: null) are only supported via API token mode
-      // (see api-token-mode.ts). The OAuth flow always requires a user identity.
-      if (!user) {
-        return new OAuthError(
-          'server_error',
-          'Failed to fetch user information from Cloudflare'
-        ).toHtmlResponse()
-      }
+      const identity = await getCloudflareOAuthUser(access_token)
 
       // Complete authorization
       const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
         request: oauthReqInfo,
-        userId: user.id,
-        metadata: { label: user.email },
+        userId: identity.user.id,
+        metadata: { label: identity.user.email },
         scope: oauthReqInfo.scope,
         props: {
           type: 'user_token',
-          user,
-          accounts,
-          accountCount,
+          user: identity.user,
+          accounts: identity.accounts,
+          accountCount: identity.accountCount,
           version: AUTH_PROPS_VERSION,
           accessToken: access_token,
           refreshToken: refresh_token
         } satisfies AuthProps
       })
 
-      metrics.logEvent(new AuthUser({ userId: user.id }))
+      metrics.logEvent(new AuthUser({ userId: identity.user.id }))
 
       return new Response(null, {
         status: 302,
