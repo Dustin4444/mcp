@@ -1,3 +1,4 @@
+import { CimdFetchError, type OAuthHelpers } from '@cloudflare/workers-oauth-provider'
 import { env, exports } from 'cloudflare:workers'
 import { http, HttpResponse } from 'msw'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -310,7 +311,70 @@ describe('GET /authorize', () => {
     expect(forwardedScopes).not.toContain('removed-from-catalog.read')
   })
 
-  it('logs an auth_user error and 500s for an unknown client', async () => {
+  it('does not redirect a known client with an invalid redirect URI', async () => {
+    const clientId = await registerClient()
+    const response = await exports.default.fetch(
+      new Request(
+        authorizeUrl({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: 'https://attacker.example/callback',
+          code_challenge: DOWNSTREAM_CODE_CHALLENGE,
+          code_challenge_method: 'S256'
+        })
+      ),
+      { redirect: 'manual' }
+    )
+
+    expect(response.status).toBe(400)
+    expect(response.headers.get('location')).toBeNull()
+    expect(await response.text()).toContain('Invalid redirect URI')
+  })
+
+  it('redirects a known client PKCE error with state and issuer', async () => {
+    const clientId = await registerClient()
+    const url = new URL(`${MCP_ORIGIN}/authorize`)
+    url.search = new URLSearchParams({
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      state: 'client-state'
+    }).toString()
+    const response = await exports.default.fetch(new Request(url), { redirect: 'manual' })
+
+    expect(response.status).toBe(302)
+    const redirect = new URL(response.headers.get('location')!)
+    expect(redirect.origin + redirect.pathname).toBe(REDIRECT_URI)
+    expect(redirect.searchParams.get('error')).toBe('invalid_request')
+    expect(redirect.searchParams.get('state')).toBe('client-state')
+    expect(redirect.searchParams.get('iss')).toBe(MCP_ORIGIN)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+  })
+
+  it('redirects an unsupported response type with the correct OAuth code', async () => {
+    const clientId = await registerClient()
+    const response = await exports.default.fetch(
+      new Request(
+        authorizeUrl({
+          response_type: 'unsupported',
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          state: 'client-state',
+          code_challenge: DOWNSTREAM_CODE_CHALLENGE,
+          code_challenge_method: 'S256'
+        })
+      ),
+      { redirect: 'manual' }
+    )
+
+    expect(response.status).toBe(302)
+    const redirect = new URL(response.headers.get('location')!)
+    expect(redirect.searchParams.get('error')).toBe('unsupported_response_type')
+    expect(redirect.searchParams.get('state')).toBe('client-state')
+    expect(redirect.searchParams.get('iss')).toBe(MCP_ORIGIN)
+  })
+
+  it('returns a local invalid_request page for an unknown client', async () => {
     const res = await exports.default.fetch(
       new Request(
         authorizeUrl({
@@ -323,10 +387,52 @@ describe('GET /authorize', () => {
       )
     )
 
-    // OAuthProvider rejects the unknown client; the route maps it to an error
-    // page and records an auth_user failure datapoint.
-    expect(res.status).toBe(500)
-    expect(writtenEvents(metricsSpy)).toContain('auth_user')
+    expect(res.status).toBe(400)
+    expect(await res.text()).toContain('Invalid client_id')
+    expect(writtenEvents(metricsSpy)).not.toContain('auth_user')
+  })
+
+  it('returns a local retryable error when CIMD metadata resolution fails', async () => {
+    vi.spyOn(
+      (env as Env & { OAUTH_PROVIDER: OAuthHelpers }).OAUTH_PROVIDER,
+      'lookupClient'
+    ).mockRejectedValueOnce(
+      new CimdFetchError('https://client.example.com/oauth.json', new Error('upstream timeout'))
+    )
+
+    const response = await exports.default.fetch(
+      new Request(
+        authorizeUrl({
+          response_type: 'code',
+          client_id: 'https://client.example.com/oauth.json',
+          redirect_uri: REDIRECT_URI,
+          code_challenge: DOWNSTREAM_CODE_CHALLENGE,
+          code_challenge_method: 'S256'
+        })
+      )
+    )
+
+    expect(response.status).toBe(503)
+    expect(response.headers.get('retry-after')).toBe('30')
+    expect(await response.text()).toContain('Client metadata is temporarily unavailable')
+    expect(writtenEvents(metricsSpy)).not.toContain('auth_user')
+  })
+
+  it('returns a local invalid_request page when client_id is missing', async () => {
+    const response = await exports.default.fetch(
+      new Request(
+        authorizeUrl({
+          response_type: 'code',
+          redirect_uri: REDIRECT_URI,
+          code_challenge: DOWNSTREAM_CODE_CHALLENGE,
+          code_challenge_method: 'S256'
+        })
+      )
+    )
+
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain('client_id is required')
+    expect(writtenEvents(metricsSpy)).not.toContain('auth_user')
   })
 })
 

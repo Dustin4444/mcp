@@ -24,11 +24,13 @@ import { withRefreshAdmission } from './refresh-admission-gate'
 import { MetricsTracker, AuthUser } from '../metrics'
 import { SERVER_INFO } from '../constants'
 
-import type {
-  AuthRequest,
-  OAuthHelpers,
-  TokenExchangeCallbackOptions,
-  TokenExchangeCallbackResult
+import {
+  AuthorizationError,
+  CimdFetchError,
+  type AuthRequest,
+  type OAuthHelpers,
+  type TokenExchangeCallbackOptions,
+  type TokenExchangeCallbackResult
 } from '@cloudflare/workers-oauth-provider'
 
 interface AuthEnv extends Env {
@@ -148,7 +150,34 @@ export function createAuthHandlers() {
   // GET /authorize - Show the requested scopes in the consent dialog
   app.get('/authorize', async (c) => {
     try {
-      const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw)
+      let oauthReqInfo: AuthRequest
+      try {
+        oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw)
+      } catch (error) {
+        if (error instanceof AuthorizationError) {
+          if (!error.redirectUri) {
+            return new OAuthError(error.code, error.description).toHtmlResponse()
+          }
+          const redirect = new URL(error.redirectUri)
+          redirect.searchParams.set('error', error.code)
+          redirect.searchParams.set('error_description', error.description)
+          if (error.state) redirect.searchParams.set('state', error.state)
+          if (error.issuer) redirect.searchParams.set('iss', error.issuer)
+          return new Response(null, {
+            status: 302,
+            headers: { Location: redirect.href, 'Cache-Control': 'no-store' }
+          })
+        }
+        if (error instanceof CimdFetchError) {
+          return new OAuthError(
+            'temporarily_unavailable',
+            'Client metadata is temporarily unavailable. Please try again.',
+            503,
+            { 'Retry-After': '30' }
+          ).toHtmlResponse()
+        }
+        throw error
+      }
       const defaultScopes = [...SCOPE_TEMPLATES[DEFAULT_TEMPLATE].scopes]
       const requestedScopes = oauthReqInfo.scope ?? []
       const unknownScopes = requestedScopes.filter((scope) => !ALLOWED_SCOPES.has(scope))
@@ -165,10 +194,6 @@ export function createAuthHandlers() {
         ])
       )
       oauthReqInfo.scope = scopesToRequest
-
-      if (!oauthReqInfo.clientId) {
-        return new OAuthError('invalid_request', 'Missing client_id').toHtmlResponse()
-      }
 
       const { token: csrfToken, setCookie: csrfCookie } = generateCSRFProtection()
 
