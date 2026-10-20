@@ -20,7 +20,7 @@
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^1.2.1",
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.0",
     "hono": "^4.13.5",
     "zod": "^4.3.5"
   },
